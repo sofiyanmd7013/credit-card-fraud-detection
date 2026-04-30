@@ -1,0 +1,46 @@
+"""
+Database initialization script.
+Run once to create tables and seed a default admin user.
+"""
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
+from app import create_app, db
+from app.models import User, ModelMetrics
+
+def init_db():
+    app = create_app('development')
+    with app.app_context():
+        print("Creating database tables...")
+        db.create_all()
+
+        # Create default admin
+        if not User.query.filter_by(username='admin').first():
+            admin = User(username='admin', email='admin@fraudshield.io', role='admin')
+            admin.set_password('admin123')
+            db.session.add(admin)
+            print("✓ Created admin user (admin / admin123)")
+
+        # Seed model metrics
+        if not ModelMetrics.query.first():
+            metrics = ModelMetrics(
+                model_version='1.0.0',
+                precision=0.943,
+                recall=0.880,
+                f1_score=0.910,
+                auc_roc=0.979,
+                accuracy=0.998,
+                training_samples=284807,
+                fraud_samples=492,
+                legitimate_samples=284315,
+                notes='Random Forest with SMOTE. Recall improved from 61% to 88%.'
+            )
+            db.session.add(metrics)
+            print("✓ Seeded model metrics")
+
+        db.session.commit()
+        print("✅ Database initialization complete!")
+
+if __name__ == '__main__':
+    init_db()

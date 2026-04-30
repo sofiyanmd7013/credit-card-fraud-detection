@@ -1,0 +1,185 @@
+"""
+Fraud Detection Engine
+Combines rule-based logic with ML model predictions for hybrid fraud detection.
+"""
+import pickle
+import numpy as np
+from datetime import datetime, timedelta
+from flask import current_app
+from app.models import Transaction, db
+
+
+class RuleEngine:
+    """Rule-based fraud detection system."""
+
+    def __init__(self, config):
+        self.max_amount = config.MAX_TRANSACTION_AMOUNT
+        self.max_daily = config.MAX_DAILY_TRANSACTIONS
+        self.unusual_start = config.UNUSUAL_HOUR_START
+        self.unusual_end = config.UNUSUAL_HOUR_END
+
+    def check_amount_threshold(self, amount):
+        if amount > self.max_amount:
+            return True, f"Transaction amount ${amount:.2f} exceeds threshold ${self.max_amount}"
+        return False, None
+
+    def check_unusual_hour(self, transaction_time):
+        hour = transaction_time.hour
+        if self.unusual_start <= hour <= self.unusual_end:
+            return True, f"Transaction at unusual hour: {hour:02d}:00"
+        return False, None
+
+    def check_transaction_velocity(self, customer_id, transaction_time):
+        """Check if customer has too many transactions in 24 hours."""
+        window_start = transaction_time - timedelta(hours=24)
+        recent_count = Transaction.query.filter(
+            Transaction.customer_id == customer_id,
+            Transaction.transaction_time >= window_start,
+            Transaction.transaction_time <= transaction_time
+        ).count()
+        if recent_count >= self.max_daily:
+            return True, f"High velocity: {recent_count} transactions in 24h (max: {self.max_daily})"
+        return False, None
+
+    def check_round_amount(self, amount):
+        """Flag suspiciously round amounts."""
+        if amount > 100 and amount % 100 == 0:
+            return True, f"Suspicious round amount: ${amount:.2f}"
+        return False, None
+
+    def check_foreign_transaction(self, country, customer_id):
+        """Flag transactions from countries with no prior history."""
+        prior = Transaction.query.filter(
+            Transaction.customer_id == customer_id,
+            Transaction.country == country
+        ).first()
+        if not prior and country and country.lower() not in ['us', 'usa', 'united states']:
+            return True, f"First-time transaction from country: {country}"
+        return False, None
+
+    def evaluate(self, transaction):
+        """Run all rules and return list of triggered flags."""
+        flags = []
+        checks = [
+            self.check_amount_threshold(transaction.amount),
+            self.check_unusual_hour(transaction.transaction_time),
+            self.check_transaction_velocity(transaction.customer_id, transaction.transaction_time),
+            self.check_round_amount(transaction.amount),
+            self.check_foreign_transaction(transaction.country, transaction.customer_id),
+        ]
+        for triggered, message in checks:
+            if triggered:
+                flags.append(message)
+        return flags
+
+
+class MLModel:
+    """Machine Learning fraud detection model wrapper."""
+
+    def __init__(self, model_path, scaler_path):
+        self.model = None
+        self.scaler = None
+        self._load_model(model_path, scaler_path)
+
+    def _load_model(self, model_path, scaler_path):
+        try:
+            with open(model_path, 'rb') as f:
+                self.model = pickle.load(f)
+            with open(scaler_path, 'rb') as f:
+                self.scaler = pickle.load(f)
+        except FileNotFoundError:
+            current_app.logger.warning("ML model files not found. Using dummy model.")
+            self.model = None
+            self.scaler = None
+
+    def predict_proba(self, features):
+        """Return fraud probability for a feature vector."""
+        if self.model is None:
+            return self._dummy_predict(features)
+        
+        features_array = np.array(features).reshape(1, -1)
+        if self.scaler:
+            features_array = self.scaler.transform(features_array)
+        proba = self.model.predict_proba(features_array)[0][1]
+        return float(proba)
+
+    def _dummy_predict(self, features):
+        """Fallback heuristic when model isn't loaded."""
+        amount = features[0]
+        score = 0.0
+        if amount > 5000:
+            score += 0.4
+        if amount > 10000:
+            score += 0.3
+        # Use some feature variance as signal
+        feature_vals = features[1:]
+        if feature_vals:
+            variance = np.var(feature_vals)
+            score += min(0.3, variance / 100)
+        return min(1.0, score)
+
+
+class FraudDetectionEngine:
+    """Hybrid fraud detection combining rules + ML."""
+
+    def __init__(self, app=None):
+        self.rule_engine = None
+        self.ml_model = None
+        if app:
+            self.init_app(app)
+
+    def init_app(self, app):
+        self.rule_engine = RuleEngine(app.config)
+        self.ml_model = MLModel(
+            app.config['MODEL_PATH'],
+            app.config['SCALER_PATH']
+        )
+        self.fraud_threshold = app.config.get('FRAUD_THRESHOLD', 0.5)
+        self.high_risk_threshold = app.config.get('HIGH_RISK_THRESHOLD', 0.8)
+
+    def analyze(self, transaction):
+        """
+        Full fraud analysis pipeline.
+        Returns: (ml_score, rule_flags, final_score, is_fraud, risk_level)
+        """
+        # 1. ML model prediction
+        features = transaction.get_feature_vector()
+        ml_score = self.ml_model.predict_proba(features)
+
+        # 2. Rule-based evaluation
+        rule_flags = self.rule_engine.evaluate(transaction)
+        rule_score = min(1.0, len(rule_flags) * 0.25)
+
+        # 3. Combine: 60% ML + 40% rules
+        final_score = (ml_score * 0.6) + (rule_score * 0.4)
+
+        # 4. Classify
+        is_fraud = final_score >= self.fraud_threshold
+        risk_level = self._get_risk_level(final_score)
+
+        return ml_score, rule_flags, final_score, is_fraud, risk_level
+
+    def _get_risk_level(self, score):
+        if score >= self.high_risk_threshold:
+            return 'critical'
+        elif score >= self.fraud_threshold:
+            return 'high'
+        elif score >= 0.3:
+            return 'medium'
+        return 'low'
+
+    def update_transaction(self, transaction):
+        """Analyze and persist results to a transaction object."""
+        ml_score, rule_flags, final_score, is_fraud, risk_level = self.analyze(transaction)
+
+        transaction.ml_fraud_score = ml_score
+        transaction.rule_fraud_flags = rule_flags
+        transaction.final_fraud_score = final_score
+        transaction.is_fraud_predicted = is_fraud
+        transaction.risk_level = risk_level
+        transaction.status = 'flagged' if is_fraud else 'approved'
+
+        return transaction
+
+
+fraud_engine = FraudDetectionEngine()
